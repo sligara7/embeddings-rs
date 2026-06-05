@@ -27,10 +27,32 @@ RUN cargo build --release
 
 # Pre-download the fp32 ONNX weights + tokenizer at build time (matches the
 # Python image, which pre-pulls the model so the container starts fast).
+#
+# `-f` fails the build on HTTP errors and `--retry*` rides out transient ones,
+# but Hugging Face can also answer 200 OK with an HTML interstitial (bot/JS
+# challenge or rate-limit page) in place of the file. That is exactly what
+# silently baked a ~3 KB web page in place of the model in the first v0.1.0
+# image. So after downloading we VALIDATE the bytes and hard-fail the build
+# rather than ship an unusable image: model.onnx must be ~550 MB (an HTML page
+# is a few KB) and tokenizer.json must be JSON (starts with `{`, not `<`).
 RUN mkdir -p /build/models \
     && base="https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main" \
-    && curl -sSL "$base/onnx/model.onnx"  -o /build/models/model.onnx \
-    && curl -sSL "$base/tokenizer.json"   -o /build/models/tokenizer.json
+    && curl -fSL --retry 5 --retry-delay 5 --retry-all-errors \
+        -A "embeddings-rs-docker-build" \
+        "$base/onnx/model.onnx" -o /build/models/model.onnx \
+    && curl -fSL --retry 5 --retry-delay 5 --retry-all-errors \
+        -A "embeddings-rs-docker-build" \
+        "$base/tokenizer.json" -o /build/models/tokenizer.json \
+    && onnx_sz=$(wc -c < /build/models/model.onnx) \
+    && if [ "$onnx_sz" -lt 100000000 ]; then \
+        echo "ERROR: model.onnx is $onnx_sz bytes (expected ~547MB) — HF likely served HTML:"; \
+        head -c 200 /build/models/model.onnx; echo; exit 1; \
+    fi \
+    && if [ "$(head -c1 /build/models/tokenizer.json)" != "{" ]; then \
+        echo "ERROR: tokenizer.json is not JSON — HF likely served HTML:"; \
+        head -c 200 /build/models/tokenizer.json; echo; exit 1; \
+    fi \
+    && echo "weights OK: model.onnx=${onnx_sz}B tokenizer.json=$(wc -c < /build/models/tokenizer.json)B"
 
 # ort downloaded a matching libonnxruntime.so during the build — stash it so the
 # runtime stage can load it (we link dynamically, not statically).
