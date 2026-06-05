@@ -17,7 +17,19 @@ all-features = true
 # the upstream maintainer pulled). RUSTSEC vulnerabilities default to
 # deny; that default is what we want.
 yanked = "deny"
-ignore = []
+# Ignored advisories. Both below are `unmaintained` notices, NOT
+# security vulnerabilities, on deep transitive deps we don't control —
+# revisit when the upstream crates (tokenizers, utoipa-axum) drop them.
+ignore = [
+    # number_prefix is unmaintained. Pulled via indicatif -> tokenizers
+    # (progress bars during tokenizer training; unused on our inference
+    # path). No fix available without tokenizers swapping indicatif.
+    "RUSTSEC-2025-0119",
+    # paste (proc-macro, compile-time only) is no longer maintained.
+    # Pulled via tokenizers/macro_rules_attribute and utoipa-axum. Drops
+    # out when those crates migrate off it.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 # Permissive-license allowlist. Any dep with a license outside this
