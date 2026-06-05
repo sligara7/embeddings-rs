@@ -1,0 +1,26 @@
+# Avoid shipping build artifacts and developer state into the build
+# context. The runtime image only needs the source tree; cargo
+# rebuilds inside the builder stage and the Dockerfile downloads the
+# model weights itself.
+
+target/
+.git/
+.github/
+.idea/
+.vscode/
+**/*.rs.bk
+*.swp
+*.swo
+.env
+.envrc
+
+# Weights are fetched inside the builder stage, never copied from the
+# host context — keep the ~550 MB model out of the build context.
+models/model.onnx
+models/tokenizer.json
+
+# Container artifacts themselves don't need to enter the build
+# context; they're driven from the host.
+docker-compose.yml
+.dockerignore
+Dockerfile

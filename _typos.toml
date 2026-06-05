@@ -1,0 +1,7 @@
+# typos config. Allowlists are case-sensitive. Keep entries narrow —
+# the value is exactly the lookup key, and prefer renaming/rewording
+# in source over allowlisting whenever possible.
+#
+# Local usage: `cargo install typos-cli && typos`. CI runs the same.
+
+[default.extend-words]

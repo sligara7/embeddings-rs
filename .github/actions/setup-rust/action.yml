@@ -1,0 +1,25 @@
+name: Setup Rust
+description: >
+  Install the pinned Rust toolchain and restore the cargo cache. The
+  single place the dtolnay/rust-toolchain action SHA is pinned, so a bump
+  touches one file instead of every job. The caller must run
+  actions/checkout first (a local composite action needs the repo on
+  disk before it can be resolved).
+
+inputs:
+  toolchain:
+    description: Rust toolchain to install (e.g. the workflow's RUST_TOOLCHAIN).
+    required: true
+  components:
+    description: Comma-separated rustup components (e.g. "rustfmt, clippy"). Empty for none.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master 2026-05-04
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+    - uses: Swatinem/rust-cache@v2

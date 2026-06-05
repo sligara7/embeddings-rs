@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded in-progress runs for the same PR (a new push obsoletes
+# the prior run). Pushes to main are never cancelled — each main commit
+# gets a complete run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned so a clippy-lint expansion can't break CI without a code
+  # change. Bump deliberately.
+  RUST_TOOLCHAIN: "1.95.0"
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # ort's binary downloader (ureq -> native-tls) links openssl, so the
+      # build needs pkg-config + libssl-dev present. ubuntu-latest ships
+      # them, but install explicitly so a runner-image change can't break
+      # the build silently.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+      # --all-targets builds tests/benches too. The openapi_contract test
+      # exercises `--dump-openapi`, which exits before loading the ONNX
+      # model, so no ~550 MB weights download is needed in CI.
+      - run: cargo build --all-targets
+      - run: cargo test
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test-release:
+    # Tests under the release profile. Catches the class that only
+    # manifests with optimizations on and debug assertions off:
+    # saturating `as` casts and any `debug_assert!`-guarded check that
+    # silently vanishes in release. fmt/clippy are profile-agnostic and
+    # stay in build-test; this leg adds only the missing coverage.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - run: cargo test --release
+
+  cargo-deny:
+    # Supply-chain hygiene: security advisories (RUSTSEC), license
+    # compliance, duplicate-version detection. See deny.toml.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  typos:
+    # Catches typos in source, docs, comments. Uses crate-ci/typos
+    # defaults; if a project-specific term gets flagged, allowlist it
+    # via _typos.toml at repo root.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: crate-ci/typos@v1.46.0

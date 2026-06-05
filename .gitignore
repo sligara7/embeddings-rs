@@ -1,0 +1,20 @@
+/target/
+**/*.rs.bk
+
+# Model weights are NOT vendored — they're fetched into models/ at build
+# time (see README "Build & run" and the Dockerfile). model.onnx is ~550 MB
+# and tokenizer.json is regenerable from the same Hugging Face revision, so
+# neither belongs in git. The small companion configs (config.json,
+# tokenizer_config.json, special_tokens_map.json) stay tracked as a record of
+# the exact source revision.
+models/model.onnx
+models/tokenizer.json
+
+# Local-only working notes (review trackers, scratch plans)
+*.local.md
+
+# proptest's failing-seed corpus. We don't persist it: CI explores fresh
+# random cases each run, and a committed file is easy to populate with
+# noise (e.g. seeds from a deliberately-broken local experiment). If a
+# real shrink is worth pinning, add it as an explicit unit test instead.
+proptest-regressions/

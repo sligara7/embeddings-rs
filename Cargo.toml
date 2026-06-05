@@ -1,0 +1,29 @@
+[package]
+name = "embeddings-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust/ort parity sidecar for nomic-embed-text-v1.5 — drop-in for the Python embeddings service"
+license = "MIT"
+repository = "https://github.com/sligara7/embeddings-rs"
+readme = "README.md"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = "0.20"
+# download-binaries: ort fetches a matching onnxruntime at build time so we
+# don't have to vendor the native lib. We feed ort the (shape, Vec) tensor
+# form directly, so no ndarray dependency / version-conflict.
+ort = { version = "2.0.0-rc.10", features = ["download-binaries"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# OpenAPI: ToSchema derives the request/response schemas from the real structs;
+# utoipa-axum ties path registration to the router so the spec can't omit a route.
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-axum = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

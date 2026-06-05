@@ -1,0 +1,216 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "embeddings-rs",
+    "description": "Embedding sidecar for nomic-embed-text-v1.5 (768-dim). Drop-in for the Python `embeddings` service.",
+    "license": {
+      "name": "MIT",
+      "identifier": "MIT"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/embed": {
+      "post": {
+        "tags": [
+          "embeddings"
+        ],
+        "summary": "Embed a single text into a 768-dim vector.",
+        "operationId": "handle_embed",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmbedRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Embedding vector",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EmbedResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/embed-batch": {
+      "post": {
+        "tags": [
+          "embeddings"
+        ],
+        "summary": "Embed multiple texts in one call.",
+        "operationId": "handle_embed_batch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmbedBatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Embedding vectors",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EmbedBatchResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "embeddings"
+        ],
+        "summary": "Liveness + model info.",
+        "operationId": "handle_health",
+        "responses": {
+          "200": {
+            "description": "Healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "EmbedBatchRequest": {
+        "type": "object",
+        "required": [
+          "texts"
+        ],
+        "properties": {
+          "task_type": {
+            "type": "string",
+            "default": "search_document",
+            "example": "search_document"
+          },
+          "texts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Texts to embed; padded to the longest in the batch."
+          }
+        }
+      },
+      "EmbedBatchResponse": {
+        "type": "object",
+        "required": [
+          "vectors",
+          "count",
+          "dimensions"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "dimensions": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "vectors": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "number",
+                "format": "float"
+              }
+            }
+          }
+        }
+      },
+      "EmbedRequest": {
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "properties": {
+          "task_type": {
+            "type": "string",
+            "description": "nomic task prefix; prepended as `\"{task_type}: {text}\"` before encoding.",
+            "default": "search_document",
+            "example": "search_document"
+          },
+          "text": {
+            "type": "string",
+            "description": "Text to embed.",
+            "example": "The dragon coiled around the obsidian spire."
+          }
+        }
+      },
+      "EmbedResponse": {
+        "type": "object",
+        "required": [
+          "vector",
+          "dimensions"
+        ],
+        "properties": {
+          "dimensions": {
+            "type": "integer",
+            "description": "Always 768 for nomic-embed-text-v1.5.",
+            "minimum": 0
+          },
+          "vector": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "format": "float"
+            },
+            "description": "Raw (un-normalized) masked-mean-pooled embedding; `|v|` ~= 22."
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "model",
+          "dimensions"
+        ],
+        "properties": {
+          "dimensions": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "model": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "embeddings",
+      "description": "Text embedding endpoints"
+    }
+  ]
+}

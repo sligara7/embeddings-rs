@@ -1,0 +1,69 @@
+# cargo-deny config. Run via the `cargo-deny` CI job (see
+# .github/workflows/ci.yml) on every PR + main push. Local usage:
+#
+#   cargo install --locked cargo-deny
+#   cargo deny check
+#
+# Tighten or relax over time as the dep tree evolves; the goal is to
+# fail loudly on supply-chain hygiene issues, not to chase ergonomic
+# warnings.
+
+[graph]
+# Check the whole dep tree, including dev-deps + optional features.
+all-features = true
+
+[advisories]
+# Hard-fail on yanked deps (likely a security or correctness issue
+# the upstream maintainer pulled). RUSTSEC vulnerabilities default to
+# deny; that default is what we want.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive-license allowlist. Any dep with a license outside this
+# list fails CI; reach for `exceptions` (file-scoped) only after
+# auditing what the dep actually does.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    # webpki-roots ships under CDLA-Permissive-2.0 (Linux Foundation
+    # Community Data License — commercial use, modification, and
+    # redistribution explicitly permitted). Pulled in transitively via
+    # ort's binary downloader (ureq -> rustls) TLS roots.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[bans]
+# `wildcards = "deny"` blocks `version = "*"` deps in Cargo.toml —
+# they pin to nothing and cause reproducibility drift.
+wildcards = "deny"
+# `multiple-versions = "warn"` lets us see when two versions of the
+# same crate ship in the binary (cause: a transitive dep specifies an
+# incompatible range). Warn rather than deny — sometimes unavoidable
+# without forking. Revisit if it becomes noisy.
+multiple-versions = "warn"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# Block deps pulled from arbitrary registries. We use crates.io and
+# git deps from github.com only; anything else is suspicious.
+unknown-registry = "deny"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
