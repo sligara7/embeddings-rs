@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.1.0"
+    "version": "0.1.1"
   },
   "paths": {
     "/embed": {
@@ -112,7 +112,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Texts to embed; padded to the longest in the batch."
+            "description": "Texts to embed. Processed in token-bounded sub-batches internally, so a\nlarge request (or one with a very long text) is handled without a memory\nspike; vectors are returned in input order."
           }
         }
       },
