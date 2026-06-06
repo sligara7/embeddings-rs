@@ -39,6 +39,10 @@ struct AppState {
     sem: Semaphore,
     tokenizer: Tokenizer,
     dim: usize,
+    /// Max tokens (rows × padded seq-len) per ONNX `run()`. Bounds forward-pass
+    /// activation memory — which scales with batch×seq (+ O(seq²) attention), NOT
+    /// with the number of texts. See [`embed_prefixed`].
+    max_batch_tokens: usize,
 }
 
 impl AppState {
@@ -55,7 +59,12 @@ impl AppState {
 
         let state = self.clone();
         let (result, session) = tokio::task::spawn_blocking(move || {
-            let v = embed_prefixed(&mut session, &state.tokenizer, &prefixed);
+            let v = embed_prefixed(
+                &mut session,
+                &state.tokenizer,
+                &prefixed,
+                state.max_batch_tokens,
+            );
             (v, session)
         })
         .await
@@ -82,7 +91,9 @@ struct EmbedRequest {
 
 #[derive(Deserialize, ToSchema)]
 struct EmbedBatchRequest {
-    /// Texts to embed; padded to the longest in the batch.
+    /// Texts to embed. Processed in token-bounded sub-batches internally, so a
+    /// large request (or one with a very long text) is handled without a memory
+    /// spike; vectors are returned in input order.
     texts: Vec<String>,
     #[serde(default = "default_task")]
     #[schema(example = "search_document", default = "search_document")]
@@ -117,17 +128,82 @@ struct HealthResponse {
 
 /// Embed a batch of already-prefixed strings on the given session. Returns raw
 /// (un-normalized) masked-mean-pooled vectors, one per input.
+///
+/// A forward pass allocates activations proportional to `batch × seq` (plus
+/// O(seq²) attention per layer) where `seq` is the longest text IN THE BATCH —
+/// so one 8192-token fragment dragged into a batch of ten pads all ten to 8192
+/// and blows peak RAM (the cgroup-v2 OOM that crashed bulk re-embeds). To make
+/// peak memory a function of an internal cap rather than of request size, we
+/// tokenize once (UNpadded — so we see true lengths), then process the inputs in
+/// order-preserving sub-batches each bounded by `max_batch_tokens` (rows × the
+/// sub-batch's own max seq). Large requests are transparently handled as several
+/// sequential `run()`s. A single text always runs even if it alone exceeds the
+/// cap (its sequence can't be split without changing the embedding).
+///
+/// Each sub-batch is zero-padded to ITS OWN longest member inside
+/// [`run_encodings`] — identical tensors to the old global-BatchLongest padding,
+/// so embeddings are byte-for-byte unchanged.
 fn embed_prefixed(
     session: &mut Session,
     tokenizer: &Tokenizer,
     prefixed: &[String],
+    max_batch_tokens: usize,
 ) -> Vec<Vec<f32>> {
-    // Tokenize (padding to longest + truncation are configured on the tokenizer).
+    if prefixed.is_empty() {
+        return Vec::new();
+    }
+    // Unpadded tokenization (padding is disabled on the tokenizer) → true lengths
+    // drive sub-batch planning; truncation to MAX_LEN still applies.
     let encodings = tokenizer
         .encode_batch(prefixed.to_vec(), true)
         .expect("tokenization failed");
 
+    let lengths: Vec<usize> = encodings.iter().map(|e| e.get_ids().len()).collect();
+    let mut result: Vec<Vec<f32>> = Vec::with_capacity(encodings.len());
+    for (start, end) in plan_subbatches(&lengths, max_batch_tokens) {
+        result.extend(run_encodings(session, &encodings[start..end]));
+    }
+    result
+}
+
+/// Partition `lengths` (token counts, in input order) into contiguous
+/// `[start, end)` sub-batch ranges such that, for each range, `rows × (max length
+/// in the range) ≤ max_batch_tokens` — the quantity that bounds a forward pass's
+/// activation memory. Order-preserving (so results reassemble trivially). A single
+/// item is always emitted as its own range even if it alone exceeds the budget (a
+/// text's sequence can't be split without changing its embedding).
+fn plan_subbatches(lengths: &[usize], max_batch_tokens: usize) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < lengths.len() {
+        let mut end = start;
+        let mut max_seq = 0usize;
+        while end < lengths.len() {
+            let new_max = max_seq.max(lengths[end]);
+            let rows = end - start + 1;
+            // Always take the first item (rows == 1); otherwise stop before
+            // exceeding the budget.
+            if rows > 1 && rows * new_max > max_batch_tokens {
+                break;
+            }
+            max_seq = new_max;
+            end += 1;
+        }
+        ranges.push((start, end));
+        start = end;
+    }
+    ranges
+}
+
+/// Run one sub-batch of (unpadded) encodings through the model and return raw
+/// masked-mean-pooled vectors, one per encoding. Zero-pads to the sub-batch's own
+/// longest member. Split out of [`embed_prefixed`] so the token-budget planner can
+/// call it per sub-batch.
+fn run_encodings(session: &mut Session, encodings: &[tokenizers::Encoding]) -> Vec<Vec<f32>> {
     let batch = encodings.len();
+    if batch == 0 {
+        return Vec::new();
+    }
     let seq = encodings
         .iter()
         .map(|e| e.get_ids().len())
@@ -258,7 +334,7 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Json<HealthRespons
     info(
         title = "embeddings-rs",
         description = "Embedding sidecar for nomic-embed-text-v1.5 (768-dim). Drop-in for the Python `embeddings` service.",
-        version = "0.1.0"
+        version = "0.1.1"
     ),
     tags((name = "embeddings", description = "Text embedding endpoints"))
 )]
@@ -306,10 +382,11 @@ async fn main() {
             ..Default::default()
         }))
         .expect("set truncation");
-    tokenizer.with_padding(Some(tokenizers::PaddingParams {
-        strategy: tokenizers::PaddingStrategy::BatchLongest,
-        ..Default::default()
-    }));
+    // Padding is done per-sub-batch in `run_encodings` (zero-fill to the sub-batch
+    // max), NOT globally — global BatchLongest would pad every text to the single
+    // longest in the request, defeating the token-budget chunking. Disable it so
+    // `encode_batch` returns true lengths for the planner.
+    tokenizer.with_padding(None);
 
     // Pool of N independent sessions ("lanes"). Each session is another full
     // copy of the model weights in RAM (~550 MB), so scale with mem_limit.
@@ -325,6 +402,16 @@ async fn main() {
         .unwrap_or(4);
     let intra = std::cmp::max(1, cores / pool_size);
 
+    // Tokens-per-run cap (rows × padded seq). Floored at MAX_LEN so a single
+    // full-length text can always run. Default 16384 = two full-length texts'
+    // worth of activations — keeps peak well inside a 3 GB lane budget while
+    // still batching many short texts together.
+    let max_batch_tokens: usize = std::env::var("EMBEDDING_MAX_BATCH_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(|n: usize| n.max(MAX_LEN))
+        .unwrap_or(16_384);
+
     let mut sessions = Vec::with_capacity(pool_size);
     for _ in 0..pool_size {
         let session = Session::builder()
@@ -336,7 +423,8 @@ async fn main() {
         sessions.push(session);
     }
     tracing::info!(
-        "loaded {pool_size} session lane(s), {intra} intra-op thread(s) each ({cores} cores)"
+        "loaded {pool_size} session lane(s), {intra} intra-op thread(s) each ({cores} cores); \
+         max_batch_tokens={max_batch_tokens}"
     );
 
     let state = Arc::new(AppState {
@@ -344,6 +432,7 @@ async fn main() {
         sessions: Mutex::new(sessions),
         tokenizer,
         dim: 768,
+        max_batch_tokens,
     });
 
     let (router, api) = api_router();
@@ -369,4 +458,77 @@ async fn main() {
     tracing::info!("embeddings-rs ({MODEL_NAME}) listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     axum::serve(listener, app).await.expect("serve");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plan_subbatches;
+
+    /// Every emitted sub-batch must respect the token budget (except a lone
+    /// over-budget item, which must still appear as its own range), and the
+    /// ranges must tile the input contiguously in order.
+    fn assert_valid(lengths: &[usize], budget: usize) -> Vec<(usize, usize)> {
+        let ranges = plan_subbatches(lengths, budget);
+        // Contiguous cover in order.
+        let mut cursor = 0;
+        for &(s, e) in &ranges {
+            assert_eq!(s, cursor, "ranges must be contiguous: {ranges:?}");
+            assert!(e > s, "ranges must be non-empty: {ranges:?}");
+            let rows = e - s;
+            let max_seq = lengths[s..e].iter().copied().max().unwrap_or(0);
+            if rows > 1 {
+                assert!(
+                    rows * max_seq <= budget,
+                    "multi-item range {s}..{e} (rows={rows}, max_seq={max_seq}) exceeds budget {budget}"
+                );
+            }
+            cursor = e;
+        }
+        assert_eq!(
+            cursor,
+            lengths.len(),
+            "ranges must cover all items: {ranges:?}"
+        );
+        ranges
+    }
+
+    #[test]
+    fn empty_input() {
+        assert!(plan_subbatches(&[], 16384).is_empty());
+    }
+
+    #[test]
+    fn all_short_pack_into_one() {
+        assert_eq!(assert_valid(&[10, 10, 10], 100), vec![(0, 3)]);
+    }
+
+    #[test]
+    fn splits_when_budget_exceeded() {
+        // 2*50=100 (ok), 3*50=150 (>100) → split into pairs.
+        assert_eq!(assert_valid(&[50, 50, 50, 50], 100), vec![(0, 2), (2, 4)]);
+    }
+
+    #[test]
+    fn single_over_budget_item_runs_alone() {
+        assert_eq!(assert_valid(&[8192], 100), vec![(0, 1)]);
+        // Over-budget item flushes on its own, neighbors batch separately.
+        assert_eq!(
+            assert_valid(&[10, 9000, 10], 100),
+            vec![(0, 1), (1, 2), (2, 3)]
+        );
+    }
+
+    #[test]
+    fn long_then_short_respects_running_max() {
+        // start at 8000: rows1=8000; rows2 → 2*8000=16000 ≤16384 ok;
+        // rows3 → 3*8000=24000 >16384 break.
+        assert_eq!(assert_valid(&[8000, 10, 10], 16384), vec![(0, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn budget_floored_at_one_full_text() {
+        // A realistic mix never violates the bound at the default budget.
+        let lengths = [8192, 12, 40, 8000, 7, 7, 7, 6000, 5, 5, 5, 5];
+        assert_valid(&lengths, 16384);
+    }
 }
