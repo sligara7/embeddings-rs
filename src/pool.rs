@@ -199,6 +199,22 @@ mod tests {
         id: usize,
     }
 
+    /// Acquire a lane, failing LOUDLY if the pool has starved.
+    ///
+    /// Never use a bare `acquire().await` in a test. A starved pool does not
+    /// error — it waits forever on a queue that will never move — so a
+    /// regression would HANG the suite instead of failing it, and silence reads
+    /// as "still running" rather than "broken". That is the same invisible
+    /// failure shape as the outage this module exists to prevent, and it is not
+    /// acceptable in the tests that guard against it.
+    async fn acquire_or_fail(pool: &Arc<LanePool<DummyLane>>) -> Lane<DummyLane> {
+        match tokio::time::timeout(Duration::from_millis(500), pool.acquire()).await {
+            Ok(Some(lane)) => lane,
+            Ok(None) => panic!("pool reports every lane permanently lost"),
+            Err(_) => panic!("STARVED: acquire() timed out — the pool had no lane to give"),
+        }
+    }
+
     fn pool_of(n: usize) -> Arc<LanePool<DummyLane>> {
         Arc::new(LanePool::new((0..n).map(|id| DummyLane { id }).collect()))
     }
@@ -208,7 +224,7 @@ mod tests {
     async fn success_returns_the_lane() {
         let pool = pool_of(2);
         {
-            let mut lane = pool.acquire().await.expect("lane available");
+            let mut lane = acquire_or_fail(&pool).await;
             let _ = lane.get_mut();
         }
         assert_eq!(pool.available_capacity(), 2);
@@ -224,7 +240,7 @@ mod tests {
     #[tokio::test]
     async fn panic_in_blocking_closure_returns_the_lane() {
         let pool = pool_of(2);
-        let lane = pool.acquire().await.expect("lane available");
+        let lane = acquire_or_fail(&pool).await;
 
         let joined = tokio::task::spawn_blocking(move || {
             // The guard is moved in, so unwinding runs its Drop.
@@ -267,7 +283,7 @@ mod tests {
         let work = {
             let pool = Arc::clone(&pool);
             async move {
-                let lane = pool.acquire().await.expect("lane available");
+                let lane = acquire_or_fail(&pool).await;
                 tokio::task::spawn_blocking(move || {
                     let mut lane = lane;
                     let _ = lane.get_mut();
@@ -303,7 +319,7 @@ mod tests {
     async fn repeated_panics_never_exhaust_the_pool() {
         let pool = pool_of(2);
         for _ in 0..10 {
-            let lane = pool.acquire().await.expect("lane available");
+            let lane = acquire_or_fail(&pool).await;
             let _ = tokio::task::spawn_blocking(move || {
                 // Moved in on purpose: its Drop must run while unwinding.
                 let _lane = lane;
@@ -346,7 +362,7 @@ mod tests {
             (0..2).map(|id| DummyLane { id }).collect(),
         ));
         for _ in 0..2 {
-            let lane = pool.acquire().await.expect("lane available");
+            let lane = acquire_or_fail(&pool).await;
             let _ = tokio::task::spawn_blocking(move || {
                 // Moved in on purpose: its Drop must run while unwinding.
                 let _lane = lane;
@@ -370,7 +386,7 @@ mod tests {
         for _ in 0..2 {
             let pool2 = Arc::clone(&pool);
             let work = async move {
-                let lane = pool2.acquire().await.expect("lane available");
+                let lane = acquire_or_fail(&pool2).await;
                 tokio::task::spawn_blocking(move || {
                     // Moved in on purpose: its Drop runs when the task ends.
                     let _lane = lane;
