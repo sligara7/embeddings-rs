@@ -15,28 +15,33 @@
 //!   POST /embed-batch  {texts, task_type} -> {vectors, count, dimensions}
 //!   GET  /health       -> {status, model, dimensions}
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::{extract::State, Json};
 use ort::session::Session;
 use ort::value::Value;
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
-use tokio::sync::Semaphore;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
+
+mod pool;
+use pool::LanePool;
 
 const MODEL_NAME: &str = "nomic-ai/nomic-embed-text-v1.5";
 const MAX_LEN: usize = 8192;
 
 /// A pool of N independent ONNX sessions ("lanes"). ort's `run` needs `&mut
 /// self`, so a session can't be shared for concurrent inference — instead we
-/// keep N of them and hand one out per in-flight request. `sem` has exactly N
-/// permits, so a permit-holder is always guaranteed a session to pop. N lanes
-/// cost N x the model weights in RAM (see EMBEDDING_POOL_SIZE / mem_limit).
+/// keep N of them and hand one out per in-flight request. N lanes cost N x the
+/// model weights in RAM (see EMBEDDING_POOL_SIZE / mem_limit).
+///
+/// The lane accounting lives in [`LanePool`], where holding the lane IS holding
+/// the right to use it — see that module for the outage this replaced.
 struct AppState {
-    sessions: Mutex<Vec<Session>>,
-    sem: Semaphore,
+    pool: LanePool<Session>,
     tokenizer: Tokenizer,
     dim: usize,
     /// Max tokens (rows × padded seq-len) per ONNX `run()`. Bounds forward-pass
@@ -45,36 +50,69 @@ struct AppState {
     max_batch_tokens: usize,
 }
 
+/// Why a request could not be served. Both arms are LOUD: logged here and
+/// returned to the caller as a real status code, never swallowed into an empty
+/// success. A 200 with no vectors would be the silent failure this service was
+/// built out of.
+enum EmbedError {
+    /// Every lane is permanently gone, so waiting could never succeed.
+    PoolExhausted,
+    /// The inference task panicked (or was aborted). The lane itself is safe —
+    /// its guard returned it while unwinding.
+    Inference,
+}
+
+impl IntoResponse for EmbedError {
+    fn into_response(self) -> Response {
+        match self {
+            EmbedError::PoolExhausted => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "embedding pool exhausted: no usable inference lanes remain",
+            ),
+            EmbedError::Inference => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "embedding inference failed",
+            ),
+        }
+        .into_response()
+    }
+}
+
 impl AppState {
     /// Acquire a lane, run inference off the async runtime, return the lane.
-    async fn embed(self: &Arc<Self>, prefixed: Vec<String>) -> Vec<Vec<f32>> {
-        // Wait until a lane is free (no busy-wait; the permit gates concurrency).
-        let _permit = self.sem.acquire().await.expect("semaphore closed");
-        let mut session = self
-            .sessions
-            .lock()
-            .unwrap()
-            .pop()
-            .expect("permit guarantees an available session");
+    ///
+    /// The lane guard is **moved into the blocking closure**, which is what makes
+    /// the pool leak-proof: a blocking task always runs to completion, so the
+    /// guard's `Drop` returns the lane on success, on panic, and on caller
+    /// cancellation alike. Nothing in this function returns the lane by hand,
+    /// because anything done by hand is skipped by an early exit.
+    async fn embed(self: &Arc<Self>, prefixed: Vec<String>) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let mut lane = self.pool.acquire().await.ok_or_else(|| {
+            tracing::error!(
+                capacity = self.pool.capacity(),
+                lost = self.pool.lost(),
+                "refusing request: every inference lane has been lost"
+            );
+            EmbedError::PoolExhausted
+        })?;
 
         let state = self.clone();
-        let (result, session) = tokio::task::spawn_blocking(move || {
-            let v = embed_prefixed(
-                &mut session,
+        tokio::task::spawn_blocking(move || {
+            embed_prefixed(
+                lane.get_mut(),
                 &state.tokenizer,
                 &prefixed,
                 state.max_batch_tokens,
-            );
-            (v, session)
+            )
         })
         .await
-        .expect("inference task panicked");
-
-        // Return the lane BEFORE the permit drops, so the next waiter finds one.
-        // (If the blocking task had panicked the session would be lost and the
-        // pool would shrink by one; restart: unless-stopped heals that.)
-        self.sessions.lock().unwrap().push(session);
-        result
+        .map_err(|err| {
+            // The task panicked. Surface it — do NOT unwrap it into a panic of
+            // our own, and do NOT return an empty vector that would read as
+            // success to the caller.
+            tracing::error!(error = %err, "inference task failed; lane was returned by its guard");
+            EmbedError::Inference
+        })
     }
 }
 
@@ -124,6 +162,13 @@ struct HealthResponse {
     status: String,
     model: String,
     dimensions: usize,
+    /// Inference lanes the pool was built with (`EMBEDDING_POOL_SIZE`).
+    lanes_total: usize,
+    /// Lanes that can still serve a request. Equals `lanes_total` in a healthy
+    /// process; a lower number means capacity was permanently lost and is worth
+    /// alerting on. When this reaches 0 the endpoint returns **503**, because a
+    /// liveness probe that passes while every request fails is worse than none.
+    lanes_available: usize,
 }
 
 /// Embed a batch of already-prefixed strings on the given session. Returns raw
@@ -277,53 +322,78 @@ fn run_encodings(session: &mut Session, encodings: &[tokenizers::Encoding]) -> V
 #[utoipa::path(
     post, path = "/embed", tag = "embeddings",
     request_body = EmbedRequest,
-    responses((status = 200, description = "Embedding vector", body = EmbedResponse))
+    responses(
+        (status = 200, description = "Embedding vector", body = EmbedResponse),
+        (status = 500, description = "Inference failed"),
+        (status = 503, description = "No usable inference lanes remain")
+    )
 )]
 async fn handle_embed(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EmbedRequest>,
-) -> Json<EmbedResponse> {
+) -> Result<Json<EmbedResponse>, EmbedError> {
     let prefixed = vec![format!("{}: {}", req.task_type, req.text)];
-    let vectors = state.embed(prefixed).await;
+    let vectors = state.embed(prefixed).await?;
     let vector = vectors.into_iter().next().unwrap_or_default();
     let dimensions = vector.len();
-    Json(EmbedResponse { vector, dimensions })
+    Ok(Json(EmbedResponse { vector, dimensions }))
 }
 
 /// Embed multiple texts in one call.
 #[utoipa::path(
     post, path = "/embed-batch", tag = "embeddings",
     request_body = EmbedBatchRequest,
-    responses((status = 200, description = "Embedding vectors", body = EmbedBatchResponse))
+    responses(
+        (status = 200, description = "Embedding vectors", body = EmbedBatchResponse),
+        (status = 500, description = "Inference failed"),
+        (status = 503, description = "No usable inference lanes remain")
+    )
 )]
 async fn handle_embed_batch(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EmbedBatchRequest>,
-) -> Json<EmbedBatchResponse> {
+) -> Result<Json<EmbedBatchResponse>, EmbedError> {
     let prefixed: Vec<String> = req
         .texts
         .iter()
         .map(|t| format!("{}: {}", req.task_type, t))
         .collect();
-    let vectors = state.embed(prefixed).await;
+    let vectors = state.embed(prefixed).await?;
     let count = vectors.len();
     let dimensions = vectors.first().map(|v| v.len()).unwrap_or(state.dim);
-    Json(EmbedBatchResponse {
+    Ok(Json(EmbedBatchResponse {
         vectors,
         count,
         dimensions,
-    })
+    }))
 }
 
-/// Liveness + model info.
+/// Liveness + model info + real inference-lane capacity.
+///
+/// Reports the pool's ACTUAL state and fails with 503 once no lane can serve a
+/// request. The previous version returned a hardcoded `"healthy"` and touched
+/// neither the pool nor inference — which is why `docker ps` reported healthy
+/// for the seven days this service was completely dead.
 #[utoipa::path(get, path = "/health", tag = "embeddings",
-    responses((status = 200, description = "Healthy", body = HealthResponse)))]
-async fn handle_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
-    Json(HealthResponse {
+    responses(
+        (status = 200, description = "Healthy", body = HealthResponse),
+        (status = 503, description = "No usable inference lanes remain")
+    ))]
+async fn handle_health(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<HealthResponse>, EmbedError> {
+    let lanes_available = state.pool.available_capacity();
+    if lanes_available == 0 {
+        tracing::error!("health: no usable inference lanes remain");
+        return Err(EmbedError::PoolExhausted);
+    }
+    Ok(Json(HealthResponse {
         status: "healthy".to_string(),
         model: MODEL_NAME.to_string(),
         dimensions: state.dim,
-    })
+        lanes_total: state.pool.capacity(),
+        lanes_available,
+    }))
 }
 
 /// OpenAPI document. Paths are merged in from the `#[utoipa::path]` handlers via
@@ -428,8 +498,7 @@ async fn main() {
     );
 
     let state = Arc::new(AppState {
-        sem: Semaphore::new(pool_size),
-        sessions: Mutex::new(sessions),
+        pool: LanePool::new(sessions),
         tokenizer,
         dim: 768,
         max_batch_tokens,

@@ -37,6 +37,12 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Inference failed"
+          },
+          "503": {
+            "description": "No usable inference lanes remain"
           }
         }
       }
@@ -68,6 +74,12 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Inference failed"
+          },
+          "503": {
+            "description": "No usable inference lanes remain"
           }
         }
       }
@@ -77,7 +89,8 @@
         "tags": [
           "embeddings"
         ],
-        "summary": "Liveness + model info.",
+        "summary": "Liveness + model info + real inference-lane capacity.",
+        "description": "Reports the pool's ACTUAL state and fails with 503 once no lane can serve a\nrequest. The previous version returned a hardcoded `\"healthy\"` and touched\nneither the pool nor inference — which is why `docker ps` reported healthy\nfor the seven days this service was completely dead.",
         "operationId": "handle_health",
         "responses": {
           "200": {
@@ -89,6 +102,9 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "No usable inference lanes remain"
           }
         }
       }
@@ -190,11 +206,23 @@
         "required": [
           "status",
           "model",
-          "dimensions"
+          "dimensions",
+          "lanes_total",
+          "lanes_available"
         ],
         "properties": {
           "dimensions": {
             "type": "integer",
+            "minimum": 0
+          },
+          "lanes_available": {
+            "type": "integer",
+            "description": "Lanes that can still serve a request. Equals `lanes_total` in a healthy\nprocess; a lower number means capacity was permanently lost and is worth\nalerting on. When this reaches 0 the endpoint returns **503**, because a\nliveness probe that passes while every request fails is worse than none.",
+            "minimum": 0
+          },
+          "lanes_total": {
+            "type": "integer",
+            "description": "Inference lanes the pool was built with (`EMBEDDING_POOL_SIZE`).",
             "minimum": 0
           },
           "model": {
