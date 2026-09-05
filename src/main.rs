@@ -20,6 +20,7 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{extract::State, Json};
+use ort::ep;
 use ort::session::Session;
 use ort::value::Value;
 use serde::{Deserialize, Serialize};
@@ -482,10 +483,45 @@ async fn main() {
         .map(|n: usize| n.max(MAX_LEN))
         .unwrap_or(16_384);
 
+    // CPU arena allocator. ON by default, which is ORT's own default and the
+    // behaviour every deployed version has had — this flag changes nothing unless
+    // it is set, deliberately, because the trade is real in both directions.
+    //
+    // WHY IT IS REACHABLE AT ALL (measured on production 2026-09-04): with the
+    // arena ON, ORT's BFCArena extends on a strict POWER-OF-TWO ladder and never
+    // returns the high-water. Observed grabs were exactly 64/128/256/512 MiB,
+    // 1 GiB, 2 GiB, with the largest pair asking 1.90 GiB and TAKING 2.00 GiB —
+    // so the rung after 2 GiB is 4 GiB, which cannot be reached inside a 4 GiB
+    // container that already holds the weights. The sidecar sat at 3.8 GiB of its
+    // 4 GiB cap AT IDLE, CPU 0.00%, a day after a bulk run, because only a process
+    // restart releases the arena. That is what stalls a bulk re-embed at ~600
+    // nodes and why it "recovers" by dying.
+    //
+    // ⚠️ AND `arena_extend_strategy = kSameAsRequested` IS NOT AVAILABLE HERE.
+    // In ort 2.0.0-rc.12 that option exists only on the CUDA/ROCm/MIGraphX/CANN
+    // providers (src/ep/{cuda,rocm,migraphx,cann}.rs). The CPU provider —
+    // src/ep/cpu.rs, which is what MLAS runs on the droplet — exposes exactly one
+    // arena knob: with_arena_allocator(bool), i.e. EnableCpuMemArena /
+    // DisableCpuMemArena. So getting off the ladder on CPU means turning the arena
+    // OFF, not re-strategising it.
+    //
+    // THE TRADE, stated rather than assumed: OFF means every tensor goes to the
+    // system allocator at its requested size and is freed when it drops — no
+    // ladder, no permanent high-water — at the cost of malloc/free per allocation
+    // instead of arena reuse. For a SEQUENTIAL BULK re-embed that is very likely
+    // the right side; for low-latency serving it may not be. Nobody has measured
+    // the serving cost, so the default stays ON.
+    let cpu_arena: bool = std::env::var("EMBEDDING_CPU_ARENA")
+        .ok()
+        .map(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true);
+
     let mut sessions = Vec::with_capacity(pool_size);
     for _ in 0..pool_size {
         let session = Session::builder()
             .expect("session builder")
+            .with_execution_providers([ep::CPU::default().with_arena_allocator(cpu_arena).build()])
+            .expect("register CPU execution provider")
             .with_intra_threads(intra)
             .expect("set intra threads")
             .commit_from_file(format!("{model_dir}/model.onnx"))
@@ -494,8 +530,19 @@ async fn main() {
     }
     tracing::info!(
         "loaded {pool_size} session lane(s), {intra} intra-op thread(s) each ({cores} cores); \
-         max_batch_tokens={max_batch_tokens}"
+         max_batch_tokens={max_batch_tokens}, cpu_arena={cpu_arena}"
     );
+    if !cpu_arena {
+        // Say it loudly and separately: this is a non-default allocator mode, and
+        // a reader diagnosing throughput must not have to infer it from a field at
+        // the end of another line.
+        tracing::warn!(
+            "CPU ARENA DISABLED (EMBEDDING_CPU_ARENA): allocations are sized as \
+             requested and released on drop, so RSS should no longer hold a \
+             power-of-two high-water — expect lower peak memory and some \
+             per-request allocation overhead"
+        );
+    }
 
     let state = Arc::new(AppState {
         pool: LanePool::new(sessions),

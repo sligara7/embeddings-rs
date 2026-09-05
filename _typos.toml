@@ -5,3 +5,8 @@
 # Local usage: `cargo install typos-cli && typos`. CI runs the same.
 
 [default.extend-words]
+# `cann` is Huawei's Ascend CANN execution provider — a real ort provider name
+# (ort's src/ep/cann.rs), not a misspelling of "can". It appears whenever ort's
+# provider set is enumerated, so it is allowlisted rather than reworded around:
+# the alternative is contorting any comment that names the providers precisely.
+cann = "cann"
